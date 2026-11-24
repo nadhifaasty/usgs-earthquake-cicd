@@ -1,0 +1,104 @@
+name: USGS Earthquake CI/CD
+
+on:
+  push:
+    branches: [main, feature/ingestion-gempa]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "15 */6 * * *"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ambil kode
+        uses: actions/checkout@v4
+
+      - name: Siapkan Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Pasang pytest
+        run: python -m pip install pytest
+
+      - name: Uji kode dengan CSV contoh
+        run: python -m pytest -q
+
+  ingest:
+    needs: test
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' ||
+       github.event_name == 'schedule')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ambil kode
+        uses: actions/checkout@v4
+
+      - name: Siapkan Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Ambil feed USGS
+        run: python ingest.py --output out/earthquakes.csv
+
+      - name: Simpan CSV sebagai artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: usgs-earthquakes
+          path: out/earthquakes.csv
+          if-no-files-found: error
+
+  deploy:
+    needs: ingest
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' ||
+       github.event_name == 'schedule')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Unduh artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: usgs-earthquakes
+          path: out
+
+      - name: Login ke Azure dengan OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Unggah CSV ke Azure Blob Storage
+        env:
+          STORAGE_ACCOUNT: ${{ vars.AZURE_STORAGE_ACCOUNT }}
+          STORAGE_CONTAINER: ${{ vars.AZURE_STORAGE_CONTAINER }}
+        run: |
+          test -s out/earthquakes.csv
+          az storage blob upload \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$STORAGE_CONTAINER" \
+            --name "earthquakes-${{ github.run_id }}.csv" \
+            --file out/earthquakes.csv \
+            --auth-mode login
+
+      - name: Periksa nama dan ukuran blob
+        env:
+          STORAGE_ACCOUNT: ${{ vars.AZURE_STORAGE_ACCOUNT }}
+          STORAGE_CONTAINER: ${{ vars.AZURE_STORAGE_CONTAINER }}
+        run: |
+          az storage blob show \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$STORAGE_CONTAINER" \
+            --name "earthquakes-${{ github.run_id }}.csv" \
+            --auth-mode login \
+            --query "{name:name,size:properties.contentLength}" \
+            --output table
